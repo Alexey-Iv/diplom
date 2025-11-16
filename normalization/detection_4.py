@@ -10,6 +10,7 @@ from matplotlib.patches import Arc
 from math import radians, degrees
 from scipy.ndimage import convolve
 from tensorflow.keras.models import load_model
+from datetime import datetime
 
 
 class IrisSegmenter:
@@ -296,12 +297,99 @@ class IrisSegmenter:
             h, w = binary_mask.shape[:2]
             return (int(alpha * w//2), int(betta * h//2))
 
+    def validate_iris_mask(
+        self,
+        mask,
+        min_area_ratio=0.01,
+        max_area_ratio=0.3,
+        min_circularity=0.4,
+        max_components=3
+    ):
+        """
+        Проверяет качество маски радужки и возвращает True, если маска пригодна для использования
+        """
+        # Нормализуем форму маски
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze()
 
+        h, w = mask.shape[:2]
+        total_pixels = h * w
+
+        # Преобразуем в бинарную маску для обработки
+        binary_mask = mask.astype(np.uint8) * 255
+
+        # 1. Проверка площади (радужка должна занимать разумную долю изображения)
+        area = np.count_nonzero(binary_mask)
+        area_ratio = area / total_pixels
+
+        if not (min_area_ratio <= area_ratio <= max_area_ratio):
+            print(f"Маска отклонена: плохая площадь ({area_ratio:.3f}). "
+                f"Должно быть между {min_area_ratio} и {max_area_ratio}")
+            return False
+
+        # 2. Проверка количества связных компонентов
+        num_labels, labels = cv2.connectedComponents(binary_mask.astype(np.uint8))
+        # num_labels включает фон (0), поэтому реальное количество компонент = num_labels - 1
+        num_components = num_labels - 1
+
+        if num_components == 0:
+            print(f"Маска отклонена: нет связных компонентов")
+            return False
+
+        if num_components > max_components:
+            print(f"Маска отклонена: слишком много компонентов ({num_components} > {max_components})")
+            return False
+
+        # 3. Проверка формы основного компонента (компактность)
+        # Находим самый большой компонент
+        component_sizes = [np.sum(labels == i) for i in range(1, num_labels)]
+        largest_idx = np.argmax(component_sizes) + 1
+
+        # Создаем маску только для самого большого компонента
+        largest_component = (labels == largest_idx).astype(np.uint8) * 255
+
+        # Находим контуры
+        contours, _ = cv2.findContours(largest_component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return False
+
+        cnt = contours[0]
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+
+        if perimeter == 0:
+            return False
+
+        # Вычисляем круглость (circularity): 1 для идеального круга
+        circularity = 4 * np.pi * area / (perimeter ** 2)
+
+        if circularity < min_circularity:
+            print(f"Маска отклонена: плохая круглость ({circularity:.3f} < {min_circularity})")
+            return False
+
+        # 4. Проверка позиции центра (должен быть в центральной области)
+        M = cv2.moments(cnt)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+        else:
+            cx, cy = w // 2, h // 2
+
+        # Проверяем, что центр в пределах 30-70% изображения
+        # if not (0.3 * w <= cx <= 0.7 * w and 0.3 * h <= cy <= 0.7 * h):
+        #     print(f"Маска отклонена: центр вне допустимой области ({cx}, {cy})")
+        #     return False
+
+        # Если все проверки пройдены
+        print(f"Маска принята: площадь={area_ratio:.3f}, "
+            f"компонентов={num_components}, круглость={circularity:.3f}")
+        return True
 
     def daugman_circle_detection(self, image_path, iris_mask=None, use_projections=True):
         """
         Поиск круга зрачка методом Daugman с использованием маски радужки
         """
+
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError("Не удалось загрузить изображение")
@@ -309,31 +397,62 @@ class IrisSegmenter:
         h, w = image.shape
         r_min, r_max = min(h, w)//20, min(h, w)//8
 
-        # Определение центра из маски радужки
-        if iris_mask is not None:
-            # Используем наиболее надежный метод
-            iris_mask = self.predict_iris(image_path)
-            cv2.imwrite("output_mask.png", (iris_mask * 255).astype(np.uint8))
-            estimated_center = self.get_pupil_center_from_iris_contours(iris_mask)
-            cx_init, cy_init = estimated_center
-            print(f"Центр зрачка из маски радужки: {cx_init}, {cy_init}")
+        cx_init, cy_init = w//2, h//2  # Значения по умолчанию
+        center_range = 50  # Стандартный диапазон поиска
+        mask_used = False  # Флаг использования маски
 
-            # Значительно сокращаем область поиска!
-            center_range = 20
+        # Шаг 1: Получение и валидация маски
+        current_mask = None
+        if iris_mask is not None:
+            # Используем переданную маску
+            current_mask = iris_mask
         else:
+            # Предсказываем маску, если она не передана
+            #with tf.device('/GPU:0'):
+            current_mask = self.predict_iris(image_path)
+            cv2.imwrite("predicted_mask.png", (current_mask * 255).astype(np.uint8))
+
+        # Шаг 2: Проверка качества маски
+        is_mask_valid = False
+        if current_mask is not None:
+            is_mask_valid = self.validate_iris_mask(current_mask)
+
+            # Если маска плохая - сохраняем для отладки
+            if not is_mask_valid:
+                timestamp = datetime.now().strftime("%H%M%S")
+                bad_mask_path = f"bad_mask_{timestamp}.png"
+                cv2.imwrite(bad_mask_path, (current_mask * 255).astype(np.uint8))
+                print(f"Плохая маска сохранена для анализа: {bad_mask_path}")
+
+        # Шаг 3: Выбор метода определения центра
+        if is_mask_valid:
+            # Используем маску для поиска центра
+            estimated_center = self.get_pupil_center_from_iris_contours(current_mask)
+            cx_init, cy_init = estimated_center
+            center_range = 20  # Узкий диапазон поиска
+            mask_used = True
+            print(f"Центр зрачка из ВАЛИДНОЙ маски: ({cx_init}, {cy_init})")
+        else:
+            print("Качество маски низкое, используем стандартный метод")
             # Стандартный метод без маски
             if use_projections:
                 smoothed = cv2.bilateralFilter(image, 9, 75, 75)
-                # Коррекция: оси должны быть правильными для проекций
                 region = smoothed[h//4:3*h//4, w//4:3*w//4]
-                h_proj = np.mean(region, axis=0)  # Горизонтальная проекция
-                v_proj = np.mean(region, axis=1)  # Вертикальная проекция
-                cx_init = h_proj.argmin() + w//4
-                cy_init = v_proj.argmin() + h//4
+
+                # Вертикальная проекция (для поиска X) - axis=0
+                v_proj = np.mean(region, axis=0)
+                # Горизонтальная проекция (для поиска Y) - axis=1
+                h_proj = np.mean(region, axis=1)
+
+                cx_init = v_proj.argmin() + w//4  # Ищем минимум (зрачок темный)
+                cy_init = h_proj.argmin() + h//4
+                print(f"Центр из проекций: ({cx_init}, {cy_init})")
             else:
                 cx_init, cy_init = w//2, h//2
+                print(f"Центр по умолчанию: ({cx_init}, {cy_init})")
 
             center_range = 50  # Стандартный диапазон
+
 
         # Градиенты изображения
         grad_x, grad_y = self.gaussian_derivative(image, self.sigma)
@@ -891,10 +1010,10 @@ class IrisSegmenter:
 # Пример использования
 def main():
     # Параметры (нужно определить зрачок заранее)
-    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/556/L/S5556L07.jpg"
+    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/679/L/S5679L06.jpg"
 
     # Создание сегментатора с параметрическим углом (140 градусов)
-    segmenter = IrisSegmenter(sigma=2, total_arc_angle_deg=140)
+    segmenter = IrisSegmenter(sigma=2, total_arc_angle_deg=90)
     x, y, pupil_radius = segmenter.daugman_circle_detection(image_path)
     pupil_center = (x, y)
 
