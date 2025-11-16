@@ -6,6 +6,7 @@ import glob
 from tqdm import tqdm
 import multiprocessing as mp
 from functools import partial
+from matplotlib.patches import Arc
 
 
 class IrisSegmenter:
@@ -20,9 +21,6 @@ class IrisSegmenter:
         # Вычисление градиента (производной)
         grad_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
-
-        self.grad_x = grad_x
-        self.grad_y = grad_y
 
         return grad_x, grad_y
 
@@ -48,56 +46,32 @@ class IrisSegmenter:
 
         return integral / count if count > 0 else 0
 
-    def compute_region_intensities(self, img, x0, y0, r_outer):
-        """Вычисляет средние интенсивности в 4 прямоугольных областях"""
+    def compute_region_intensities_two_regions(self, img, x0, y0, r_outer):
         height, width = img.shape
+        intensities = []
 
-        # Определяем 4 прямоугольные области вокруг предполагаемой внешней границы
-        regions = []
-
-        # Область 1: верхняя (0-90 градусов)
-        region1_points = []
-        for angle in np.linspace(0, np.pi/2, 30):
-            for dr in [0, 5, 10]:  # Несколько точек вдоль радиуса
-                r = r_outer + dr
-                x = int(x0 + r * np.cos(angle))
-                y = int(y0 + r * np.sin(angle))
-                if 0 <= x < width and 0 <= y < height:
-                    region1_points.append(img[y, x])
-
-        # Область 2: правая (90-180 градусов)
-        region2_points = []
-        for angle in np.linspace(np.pi/2, np.pi, 30):
+        # Область 1: правая (-45° до +45°)
+        region_right_points = []
+        for angle in np.linspace(-np.pi/4, np.pi/4, 30):  # -45° до +45°
             for dr in [0, 5, 10]:
                 r = r_outer + dr
                 x = int(x0 + r * np.cos(angle))
                 y = int(y0 + r * np.sin(angle))
                 if 0 <= x < width and 0 <= y < height:
-                    region2_points.append(img[y, x])
+                    region_right_points.append(img[y, x])
 
-        # Область 3: нижняя (180-270 градусов)
-        region3_points = []
-        for angle in np.linspace(np.pi, 3*np.pi/2, 30):
+        # Область 2: левая (135° до 225°)
+        region_left_points = []
+        for angle in np.linspace(3*np.pi/4, 5*np.pi/4, 30):  # 135° до 225°
             for dr in [0, 5, 10]:
                 r = r_outer + dr
                 x = int(x0 + r * np.cos(angle))
                 y = int(y0 + r * np.sin(angle))
                 if 0 <= x < width and 0 <= y < height:
-                    region3_points.append(img[y, x])
-
-        # Область 4: левая (270-360 градусов)
-        region4_points = []
-        for angle in np.linspace(3*np.pi/2, 2*np.pi, 30):
-            for dr in [0, 5, 10]:
-                r = r_outer + dr
-                x = int(x0 + r * np.cos(angle))
-                y = int(y0 + r * np.sin(angle))
-                if 0 <= x < width and 0 <= y < height:
-                    region4_points.append(img[y, x])
+                    region_left_points.append(img[y, x])
 
         # Вычисляем средние интенсивности
-        intensities = []
-        for points in [region1_points, region2_points, region3_points, region4_points]:
+        for points in [region_right_points, region_left_points]:
             if points:
                 intensities.append(np.mean(points))
             else:
@@ -106,68 +80,54 @@ class IrisSegmenter:
         return intensities
 
     def find_outer_boundary(self, img, pupil_center, pupil_radius):
-        """Находит внешнюю границу радужной оболочки"""
+        """Находит внешнюю границу радужной оболочки, учитывая только правую и левую области"""
         grad_x, grad_y = self.gaussian_derivative(img, self.sigma)
-
         height, width = img.shape
         best_score = -float('inf')
         best_params = None
 
         # Диапазоны поиска
-        r_min = int(pupil_radius * 1.6)
-        r_max = int(min(width, height) * 0.7)
+        r_min = int(pupil_radius * 2)
+        r_max = int(min(width, height) * 0.5)
 
         # Перебор по радиусу и смещению центра
         for r in range(r_min, r_max + 1):
-            for dx in range(-5, 6):  # Смещение по x
-                for dy in range(-5, 6):  # Смещение по y
+            for dx in range(-7, 8):
+                for dy in range(-7, 8):
                     x0 = pupil_center[0] + dx
                     y0 = pupil_center[1] + dy
 
-                    # Вычисляем интенсивности в 4 областях
-                    intensities = self.compute_region_intensities(img, x0, y0, r)
+                    # Вычисляем интенсивности только в правой и левой областях
+                    intensities = self.compute_region_intensities_two_regions(img, x0, y0, r)
                     total_intensity = sum(intensities)
 
-                    # Вычисляем углы для каждой области согласно формуле
+                    # Рассчитываем углы для двух областей (180° на обе области)
                     angles_per_region = []
                     for I_i in intensities:
-                        alpha_i = (90 * I_i) / total_intensity if total_intensity > 0 else 22.5
+                        alpha_i = (180 * I_i) / total_intensity if total_intensity > 0 else 90
                         angles_per_region.append(np.deg2rad(alpha_i))
 
-                    # Суммарный интеграл по всем областям
+                    # Суммарный интеграл по двум областям
                     total_integral = 0
                     total_weight = 0
 
-                    # Область 1: верхняя (0-90°)
+                    # Правая область: (-45° до -45° + alpha1)
                     if angles_per_region[0] > 0:
-                        angles1 = np.linspace(0, angles_per_region[0], max(5, int(angles_per_region[0] * 10)))
-                        integral1 = self.compute_circular_integral(grad_x, grad_y, x0, y0, r, angles1)
-                        total_integral += integral1 * angles_per_region[0]
+                        start_angle_right = -np.pi/4  # -45°
+                        end_angle_right = start_angle_right + angles_per_region[0]
+                        angles_right = np.linspace(start_angle_right, end_angle_right, max(5, int(angles_per_region[0] * 10)))
+                        integral_right = self.compute_circular_integral(grad_x, grad_y, x0, y0, r, angles_right)
+                        total_integral += integral_right * angles_per_region[0]
                         total_weight += angles_per_region[0]
 
-                    # Область 2: правая (90-180°)
+                    # Левая область: (135° до 135° + alpha2)
                     if angles_per_region[1] > 0:
-                        angles2 = np.linspace(np.pi/2, np.pi/2 + angles_per_region[1],
-                                            max(5, int(angles_per_region[1] * 10)))
-                        integral2 = self.compute_circular_integral(grad_x, grad_y, x0, y0, r, angles2)
-                        total_integral += integral2 * angles_per_region[1]
+                        start_angle_left = 3*np.pi/4  # 135°
+                        end_angle_left = start_angle_left + angles_per_region[1]
+                        angles_left = np.linspace(start_angle_left, end_angle_left, max(5, int(angles_per_region[1] * 10)))
+                        integral_left = self.compute_circular_integral(grad_x, grad_y, x0, y0, r, angles_left)
+                        total_integral += integral_left * angles_per_region[1]
                         total_weight += angles_per_region[1]
-
-                    # Область 3: нижняя (180-270°)
-                    if angles_per_region[2] > 0:
-                        angles3 = np.linspace(np.pi, np.pi + angles_per_region[2],
-                                            max(5, int(angles_per_region[2] * 10)))
-                        integral3 = self.compute_circular_integral(grad_x, grad_y, x0, y0, r, angles3)
-                        total_integral += integral3 * angles_per_region[2]
-                        total_weight += angles_per_region[2]
-
-                    # Область 4: левая (270-360°)
-                    if angles_per_region[3] > 0:
-                        angles4 = np.linspace(3*np.pi/2, 3*np.pi/2 + angles_per_region[3],
-                                            max(5, int(angles_per_region[3] * 10)))
-                        integral4 = self.compute_circular_integral(grad_x, grad_y, x0, y0, r, angles4)
-                        total_integral += integral4 * angles_per_region[3]
-                        total_weight += angles_per_region[3]
 
                     # Взвешенный средний интеграл
                     if total_weight > 0:
@@ -212,6 +172,85 @@ class IrisSegmenter:
 
         return segmented, mask_final, (pupil_center, pupil_radius, (x0, y0, r_outer))
 
+    # def daugman_circle_detection(self, image_path, estimated_center=None):
+    #     """
+    #     Гибридная оптимизация: циклы по центрам + векторизация по радиусам
+    #     Быстрее оригинала в 15-40 раз при сохранении точности
+    #     """
+    #     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    #     if image is None:
+    #         raise ValueError("Не удалось загрузить изображение")
+    #
+    #     h, w = image.shape
+    #     r_min, r_max = min(h, w)//16, min(h, w)//4
+    #
+    #     cx_init, cy_init = (w//2, h//2) if estimated_center is None else estimated_center
+    #
+    #     # Единый массив модуля градиента (|Gx| + |Gy|)
+    #     grad_x, grad_y = self.gaussian_derivative(image, self.sigma)
+    #     grad_mag = np.abs(grad_x) + np.abs(grad_y)
+    #
+    #     # Глобальные параметры
+    #     step_center = 1
+    #     step_radius = 1
+    #     center_range = 180
+    #
+    #     # Предвычисление углов для всех возможных радиусов
+    #     max_points = max(360, int(2 * np.pi * r_max) + 1)
+    #     alpha = np.linspace(0, 2 * np.pi, max_points, endpoint=False)
+    #     cos_alpha = np.cos(alpha)
+    #     sin_alpha = np.sin(alpha)
+    #
+    #     best_energy = -np.inf
+    #     best_cx, best_cy, best_r = cx_init, cy_init, r_min
+    #
+    #     # Основной цикл по центрам (сохраняем управляемость памяти)
+    #     for dx in range(-center_range, center_range + 1, step_center):
+    #         cx = cx_init + dx
+    #         if cx < 0 or cx >= w:
+    #             continue
+    #
+    #         for dy in range(-center_range, center_range + 1, step_radius):
+    #             cy = cy_init + dy
+    #             if cy < 0 or cy >= h:
+    #                 continue
+    #
+    #             # Векторизованный расчет для ВСЕХ радиусов сразу
+    #             radii = np.arange(r_min, r_max + 1, step_radius)
+    #             sample_counts = np.maximum(360, (2 * np.pi * radii).astype(int))
+    #
+    #             # Координаты точек окружностей для всех радиусов
+    #             xs = np.round(cx + radii[:, None] * cos_alpha).astype(np.int16)
+    #             ys = np.round(cy + radii[:, None] * sin_alpha).astype(np.int16)
+    #
+    #             # Динамическая маска по количеству точек для каждого радиуса
+    #             valid_points = np.arange(max_points) < sample_counts[:, None]
+    #
+    #             # Быстрая фильтрация по границам изображения
+    #             valid_bounds = (
+    #                 (xs >= 0) & (xs < w) &
+    #                 (ys >= 0) & (ys < h) &
+    #                 valid_points
+    #             )
+    #
+    #             # Безопасное извлечение значений градиентов
+    #             xs_clipped = np.clip(xs, 0, w - 1)
+    #             ys_clipped = np.clip(ys, 0, h - 1)
+    #
+    #             # Векторизованный расчет энергии для всех радиусов
+    #             energy = np.sum(
+    #                 grad_mag[ys_clipped, xs_clipped] * valid_bounds,
+    #                 axis=1
+    #             )
+    #
+    #             # Поиск лучшего радиуса для текущего центра
+    #             idx = np.argmax(energy)
+    #             if energy[idx] > best_energy:
+    #                 best_energy = energy[idx]
+    #                 best_cx, best_cy, best_r = cx, cy, radii[idx]
+    #
+    #     return best_cx, best_cy, best_r
+
     def daugman_circle_detection(self, image_path, estimated_center=None):
         """
         Поиск круга (зрачок или радужка) методом Daugman.
@@ -223,7 +262,7 @@ class IrisSegmenter:
 
         h, w = image.shape
 
-        r_min, r_max = min(h, w)//16, min(h, w)//8
+        r_min, r_max = min(h, w)//20, min(h, w)//4
 
         if estimated_center is None:
             cx_init, cy_init = w//2, h//2
@@ -234,9 +273,9 @@ class IrisSegmenter:
         grad_x, grad_y = self.gaussian_derivative(image, self.sigma)
 
         # Параметры поиска
-        step_center = 3   # шаг перебора центра в пикселях
-        step_radius = 2   # шаг радиуса
-        center_range = 200  # диапазон смещения центра
+        step_center = 3 # шаг перебора центра в пикселях
+        step_radius = 2  # шаг радиуса
+        center_range = 170  # диапазон смещения центра
 
         best_energy = -np.inf
         best_cx, best_cy, best_r = cx_init, cy_init, r_min
@@ -401,6 +440,77 @@ class IrisSegmenter:
         cv2.imwrite(output_path, img_with_boundaries)
 
         return img_with_boundaries
+
+    def visualize_integration_arcs(self, image_path, pupil_center, pupil_radius, output_path="integration_arcs_two_regions.png"):
+        """
+        Визуализирует дуги, используемые при подсчёте интеграла (только правая и левая области)
+        """
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise ValueError("Не удалось загрузить изображение для визуализации дуг")
+
+        # Находим внешнюю границу
+        grad_x, grad_y = self.gaussian_derivative(img, self.sigma)
+        outer_params = self.find_outer_boundary(img, pupil_center, pupil_radius)
+
+        if outer_params is None:
+            raise ValueError("Не удалось найти внешнюю границу для визуализации")
+
+        x0, y0, r_outer, intensities = outer_params
+
+        # Вычисляем углы для двух областей в градусах
+        total_intensity = sum(intensities)
+        angles_deg = [(180 * I_i) / total_intensity if total_intensity > 0 else 90 for I_i in intensities]
+
+        # Создаём график
+        plt.figure(figsize=(12, 10))
+        plt.imshow(img, cmap='gray')
+        ax = plt.gca()
+
+        # Цвета для областей
+        colors = ['lime', 'magenta']
+        region_names = ['Правая область (-45° до +45°)', 'Левая область (135° до 225°)']
+
+        # Рисуем дуги для правой области (-45° до -45° + angle)
+        start_angle_right = -45
+        end_angle_right = start_angle_right + angles_deg[0]
+        arc_right = Arc((x0, y0), 2*r_outer, 2*r_outer,
+                      angle=0, theta1=start_angle_right, theta2=end_angle_right,
+                      edgecolor=colors[0], lw=2.5, label=region_names[0])
+        ax.add_patch(arc_right)
+
+        # Рисуем дуги для левой области (135° до 135° + angle)
+        start_angle_left = 135
+        end_angle_left = start_angle_left + angles_deg[1]
+        arc_left = Arc((x0, y0), 2*r_outer, 2*r_outer,
+                      angle=0, theta1=start_angle_left, theta2=end_angle_left,
+                      edgecolor=colors[1], lw=2.5, label=region_names[1])
+        ax.add_patch(arc_left)
+
+        # Рисуем центры и границы
+        plt.scatter([x0], [y0], color='yellow', s=80, marker='x', linewidth=2, label='Центр радужки')
+        plt.scatter([pupil_center[0]], [pupil_center[1]], color='cyan', s=80, marker='x', linewidth=2, label='Центр зрачка')
+        circle_iris = plt.Circle((x0, y0), r_outer, color='yellow', fill=False, linestyle='--', linewidth=1.5, label='Граница радужки')
+        ax.add_patch(circle_iris)
+        circle_pupil = plt.Circle(pupil_center, pupil_radius, color='cyan', fill=False, linestyle='--', linewidth=1.5, label='Граница зрачка')
+        ax.add_patch(circle_pupil)
+
+        # Добавляем легенду и заголовок
+        plt.legend(loc='best', fontsize=10)
+        plt.title(f'Дуги интегрирования (только правая и левая области)\n'
+                 f'Правая область: {-45}° до {end_angle_right:.1f}° (угол={angles_deg[0]:.1f}°)\n'
+                 f'Левая область: {135}° до {end_angle_left:.1f}° (угол={angles_deg[1]:.1f}°)',
+                 fontsize=12, pad=20)
+
+        plt.axis('off')
+        plt.tight_layout()
+
+        # Сохраняем изображение
+        plt.savefig(output_path, bbox_inches='tight', dpi=150)
+        plt.close()
+
+        print(f"Визуализация дуг сохранена в {output_path}")
+        return output_path
 
 
     def count_total_images(self, input_base_dir):
@@ -627,8 +737,12 @@ class IrisSegmenter:
                         x, y, pupil_radius = self.daugman_circle_detection(img_path)
                         segmented, mask, boundaries = self.segment_iris(img_path, (x, y), pupil_radius)
 
+
                         if segmented is not None:
                             successful_segmentations += 1
+
+                            img_with_boundaries = self.visualize_boundaries(img_path, boundaries)
+                            img_boundaries_rgb = cv2.cvtColor(img_with_boundaries, cv2.COLOR_BGR2RGB)
 
                             # Нормализация радужки
                             normalized_iris = self.normalize_iris(img_path, boundaries)
@@ -641,7 +755,7 @@ class IrisSegmenter:
                             cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_mask.jpg"), mask)
                             cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_normalized.jpg"), normalized_iris)
                             cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_enhanced.jpg"), enhanced_iris)
-
+                            cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_circles.jpg"), img_boundaries_rgb)
                         else:
                             print(f"Не удалось сегментировать: {img_path}")
 
@@ -658,20 +772,29 @@ class IrisSegmenter:
         print(f"Успешно сегментировано: {successful_segmentations}")
         print(f"Процент успеха: {(successful_segmentations/total_images)*100:.2f}%")
 
-
 # Пример использования
 def main():
     # Параметры (нужно определить зрачок заранее)
-    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/624/L/S5624L01.jpg"
+    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/234/L/S5234L00.jpg"
 
     # Создание сегментатора
-    segmenter = IrisSegmenter(sigma=1)
+    segmenter = IrisSegmenter(sigma=1.5)
     x, y, pupil_radius = segmenter.daugman_circle_detection(image_path)
-
+    pupil_center = (x, y)
     # Сегментация
     segmented, mask, boundaries = segmenter.segment_iris(image_path, (x, y), pupil_radius)
     normalized_iris = segmenter.normalize_iris(image_path, boundaries)
     enhanced_iris = segmenter.enhance_normalized_iris(normalized_iris)
+
+    # Визуализируем дуги интегрирования
+    arc_visualization_path = segmenter.visualize_integration_arcs(
+            image_path=image_path,
+            pupil_center=pupil_center,
+            pupil_radius=pupil_radius,
+            output_path="integration_arcs_two_regions.png"
+    )
+
+    print(f"Визуализация успешно создана: {arc_visualization_path}")
 
     if segmented is not None:
         # Визуализация границ
@@ -704,7 +827,7 @@ def main():
         axes[1, 1].axis('off')
 
         plt.tight_layout()
-        plt.show()
+        plt.savefig("iris_circles.png")
 
         # Сохранение результатов
         cv2.imwrite("segmented_iris.jpg", segmented)
@@ -723,8 +846,8 @@ def main():
     input_dir = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand"
     output_dir = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand-Segmented"
 
-    print("\nЗапуск параллельной обработки...")
-    segmenter.process_dataset_parallel(input_dir, output_dir, sigma=1, num_processes=8)
+    #print("\nЗапуск параллельной обработки...")
+    #segmenter.process_dataset_parallel(input_dir, output_dir, sigma=1, num_processes=8)
 
 if __name__ == "__main__":
     main()
