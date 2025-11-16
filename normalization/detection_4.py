@@ -9,6 +9,7 @@ from functools import partial
 from matplotlib.patches import Arc
 from math import radians, degrees
 from scipy.ndimage import convolve
+from tensorflow.keras.models import load_model
 
 
 class IrisSegmenter:
@@ -143,7 +144,11 @@ class IrisSegmenter:
 
     def find_outer_boundary(self, img, pupil_center, pupil_radius):
         """Находит внешнюю границу радужной оболочки с учетом параметрического угла"""
-        grad_x, grad_y = self.gaussian_derivative(img, self.sigma)
+        img_grad = img.copy()
+        img_grad[img_grad > 180] = 0
+        cv2.imwrite("img_no_white.jpg", img_grad)
+
+        grad_x, grad_y = self.gaussian_derivative(img_grad, self.sigma)
         height, width = img.shape
         best_score = -float('inf')
         best_params = None
@@ -153,7 +158,7 @@ class IrisSegmenter:
         half_angle_rad = np.deg2rad(half_angle_deg)
 
         # Диапазоны поиска
-        r_min = int(pupil_radius * 2)
+        r_min = int(pupil_radius * 1.5)
         r_max = int(min(width, height) * 0.5)
 
         # Перебор по радиусу и смещению центра
@@ -238,36 +243,109 @@ class IrisSegmenter:
 
         return segmented, mask_final, (pupil_center, pupil_radius, (x0, y0, r_outer))
 
-    def daugman_circle_detection(self, image_path, estimated_center=None):
+    def predict_iris(self, image_path):
+        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        print(image.shape)
+        resized_image = cv2.resize(image, (320, 240))
+        image_norm = resized_image / 255.0
+        image_arr = np.array([image_norm])
+        model = load_model("./unet_model.h5")
+        prediction = model.predict(image_arr, verbose=0)
+        mask = (prediction > 0.5).astype(np.float32)
+        return mask[0]
+
+    def get_pupil_center_from_iris_contours(self, iris_mask):
         """
-        Поиск круга (зрачок или радужка) методом Daugman.
-        Возвращает: (cx, cy, radius)
+        Получение центра зрачка через анализ контуров радужки
+        Находит внутренний контур (граница радужки и зрачка)
+        """
+        binary_mask = iris_mask.astype(np.uint8) * 255
+
+        # # Нахождение всех контуров
+        # contours, hierarchy = cv2.findContours(binary_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        #
+        # if not contours:
+        #     h, w = binary_mask.shape[:2]
+        #     return (w//2, h//2)
+        #
+        # # Ищем внутренние контуры (вложенные)
+        # inner_contours = []
+        # if hierarchy is not None:
+        #     for i, contour in enumerate(contours):
+        #         # hierarchy[0][i][3] - индекс родительского контура
+        #         if hierarchy[0][i][3] != -1:  # Контур имеет родителя -> внутренний
+        #             inner_contours.append(contour)
+        #
+        # if inner_contours:
+        #     # Берем самый большой внутренний контур
+        #     inner_contour = max(inner_contours, key=cv2.contourArea)
+        #     (x, y), radius = cv2.minEnclosingCircle(inner_contour)
+        #     return (int(x), int(y))
+        #
+
+        alpha = 480 / 240
+        betta = 640 / 320
+
+        # Вариант 2 (рекомендуется): Запасной метод через центр масс
+        M = cv2.moments(binary_mask)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            return (int(alpha * cx), int(betta * cy))
+        else:
+            h, w = binary_mask.shape[:2]
+            return (int(alpha * w//2), int(betta * h//2))
+
+
+
+    def daugman_circle_detection(self, image_path, iris_mask=None, use_projections=True):
+        """
+        Поиск круга зрачка методом Daugman с использованием маски радужки
         """
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError("Не удалось загрузить изображение")
 
         h, w = image.shape
+        r_min, r_max = min(h, w)//20, min(h, w)//8
 
-        r_min, r_max = min(h, w)//20, min(h, w)//4
-
-        if estimated_center is None:
-            cx_init, cy_init = w//2, h//2
-        else:
+        # Определение центра из маски радужки
+        if iris_mask is not None:
+            # Используем наиболее надежный метод
+            iris_mask = self.predict_iris(image_path)
+            cv2.imwrite("output_mask.png", (iris_mask * 255).astype(np.uint8))
+            estimated_center = self.get_pupil_center_from_iris_contours(iris_mask)
             cx_init, cy_init = estimated_center
+            print(f"Центр зрачка из маски радужки: {cx_init}, {cy_init}")
+
+            # Значительно сокращаем область поиска!
+            center_range = 20
+        else:
+            # Стандартный метод без маски
+            if use_projections:
+                smoothed = cv2.bilateralFilter(image, 9, 75, 75)
+                # Коррекция: оси должны быть правильными для проекций
+                region = smoothed[h//4:3*h//4, w//4:3*w//4]
+                h_proj = np.mean(region, axis=0)  # Горизонтальная проекция
+                v_proj = np.mean(region, axis=1)  # Вертикальная проекция
+                cx_init = h_proj.argmin() + w//4
+                cy_init = v_proj.argmin() + h//4
+            else:
+                cx_init, cy_init = w//2, h//2
+
+            center_range = 50  # Стандартный диапазон
 
         # Градиенты изображения
         grad_x, grad_y = self.gaussian_derivative(image, self.sigma)
 
         # Параметры поиска
-        step_center = 3 # шаг перебора центра в пикселях
-        step_radius = 2  # шаг радиуса
-        center_range = 170  # диапазон смещения центра
+        step_center = 1
+        step_radius = 1  # Можно сделать шаг меньше благодаря точной оценке центра
 
         best_energy = -np.inf
         best_cx, best_cy, best_r = cx_init, cy_init, r_min
 
-        # Перебор центров вокруг примерного
+        # Перебор центров вблизи оцененного (теперь очень маленькая область!)
         for dx in range(-center_range, center_range+1, step_center):
             for dy in range(-center_range, center_range+1, step_center):
                 cx = cx_init + dx
@@ -289,7 +367,12 @@ class IrisSegmenter:
                     xs = xs[mask]
                     ys = ys[mask]
 
-                    energy = np.sum(np.abs(grad_x[ys, xs]) + np.abs(grad_y[ys, xs]))
+                    if len(xs) == 0:
+                        continue
+
+                    # Вычисление энергии по Daugman
+                    normals = (xs - cx) * grad_x[ys, xs] + (ys - cy) * grad_y[ys, xs]
+                    energy = np.sum(np.abs(normals))
 
                     if energy > best_energy:
                         best_energy = energy
@@ -535,33 +618,70 @@ class IrisSegmenter:
             subject_id = parts[-3]  # ID субъекта
             eye_type = parts[-2]    # L или R
             img_name = parts[-1]    # имя файла
+            base_name = os.path.splitext(img_name)[0]  # Определяем base_name здесь
 
             # Создаем выходную директорию
             output_subject_dir = os.path.join(output_base_dir, subject_id, eye_type)
             os.makedirs(output_subject_dir, exist_ok=True)
 
-            # Обрабатываем изображение
+            # 1. Сначала находим зрачок
             x, y, pupil_radius = segmenter.daugman_circle_detection(img_path)
-            segmented, mask, boundaries = segmenter.segment_iris(img_path, (x, y), pupil_radius)
+            pupil_center = (x, y)  # Создаем кортеж с центром зрачка
+
+            # 2. Затем сегментируем радужку
+            segmented, mask, boundaries = segmenter.segment_iris(img_path, pupil_center, pupil_radius)
 
             if segmented is not None:
-                # Нормализация радужки
+                # 3. Визуализируем дуги интегрирования ПОСЛЕ нахождения границ
+                arcs_path = os.path.join(output_subject_dir, f"{base_name}_integration_arcs.png")
+                segmenter.visualize_integration_arcs(
+                    image_path=img_path,  # Используем правильную переменную img_path
+                    pupil_center=pupil_center,  # Используем определенный pupil_center
+                    pupil_radius=pupil_radius,  # Используем найденный радиус
+                    output_path=arcs_path
+                )
+                print(f"Визуализация дуг сохранена: {arcs_path}")
+
+                # 4. Нормализация радужки
                 normalized_iris = segmenter.normalize_iris(img_path, boundaries)
                 enhanced_iris = segmenter.enhance_normalized_iris(normalized_iris)
 
-                # Сохраняем результаты
-                base_name = os.path.splitext(img_name)[0]
+                # 5. Сохраняем ВСЕ результаты
+                segmented_path = os.path.join(output_subject_dir, f"{base_name}_segmented.jpg")
+                mask_path = os.path.join(output_subject_dir, f"{base_name}_mask.jpg")
+                normalized_path = os.path.join(output_subject_dir, f"{base_name}_normalized.jpg")
+                enhanced_path = os.path.join(output_subject_dir, f"{base_name}_enhanced.jpg")
+                boundaries_path = os.path.join(output_subject_dir, f"{base_name}_boundaries.jpg")
 
-                cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_segmented.jpg"), segmented)
-                cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_mask.jpg"), mask)
-                cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_normalized.jpg"), normalized_iris)
-                cv2.imwrite(os.path.join(output_subject_dir, f"{base_name}_enhanced.jpg"), enhanced_iris)
+                # Сохраняем сегментированное изображение
+                cv2.imwrite(segmented_path, segmented)
+                # Сохраняем маску
+                cv2.imwrite(mask_path, mask)
+                # Сохраняем нормализованное изображение
+                cv2.imwrite(normalized_path, normalized_iris)
+                # Сохраняем улучшенное изображение
+                cv2.imwrite(enhanced_path, enhanced_iris)
+                # Сохраняем визуализацию границ
+                boundaries_img = segmenter.visualize_boundaries(img_path, boundaries, boundaries_path)
 
-                return {"status": "success", "path": img_path}
+                # Проверяем, что файлы действительно сохранены
+                saved_files = [
+                    arcs_path, segmented_path, mask_path,
+                    normalized_path, enhanced_path, boundaries_path
+                ]
+                for file_path in saved_files:
+                    if os.path.exists(file_path):
+                        print(f"✓ Файл сохранен: {file_path}")
+                    else:
+                        print(f"✗ Файл НЕ сохранен: {file_path}")
+
+                return {"status": "success", "path": img_path, "saved_files": saved_files}
             else:
                 return {"status": "failed", "path": img_path, "error": "Сегментация не удалась"}
 
         except Exception as e:
+            error_msg = f"Ошибка при обработке {img_path}: {str(e)}"
+            print(error_msg)  # Выводим ошибку в консоль для отладки
             return {"status": "error", "path": img_path, "error": str(e)}
 
     def process_dataset_parallel(self, input_base_dir, output_base_dir, sigma=1,
@@ -771,10 +891,10 @@ class IrisSegmenter:
 # Пример использования
 def main():
     # Параметры (нужно определить зрачок заранее)
-    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/459/L/S5459L00.jpg"
+    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/556/L/S5556L07.jpg"
 
     # Создание сегментатора с параметрическим углом (140 градусов)
-    segmenter = IrisSegmenter(sigma=1.5, total_arc_angle_deg=140)
+    segmenter = IrisSegmenter(sigma=2, total_arc_angle_deg=140)
     x, y, pupil_radius = segmenter.daugman_circle_detection(image_path)
     pupil_center = (x, y)
 
@@ -840,12 +960,14 @@ def main():
         print("Сегментация не удалась")
 
     # Пример обработки датасета с нестандартным углом
-    input_dir = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand"
-    output_dir = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand-Segmented-Custom"
+    input_dir = "./CASIA/CASIA-Iris-Thousand"
+    output_dir = "./CASIA-Iris-Thousand-Segmented-Custom"
 
-    print("\nЗапуск обработки с суммарным углом 140°...")
-    segmenter = IrisSegmenter(sigma=1, total_arc_angle_deg=140)
-    segmenter.process_dataset_sequential(input_dir, output_dir, sigma=1.5, total_arc_angle_deg=140)
+    #print("\nЗапуск обработки с суммарным углом 140°...")
+    #segmenter = IrisSegmenter(sigma=1, total_arc_angle_deg=140)
+    #segmenter.process_dataset_parallel(input_dir, output_dir, sigma=2, total_arc_angle_deg=140, num_processes=16)
 
 if __name__ == "__main__":
     main()
+
+
