@@ -363,6 +363,8 @@ class IrisSegmenter:
         # Вычисляем круглость (circularity): 1 для идеального круга
         circularity = 4 * np.pi * area / (perimeter ** 2)
 
+        print(circularity < min_circularity)
+
         if circularity < min_circularity:
             print(f"Маска отклонена: плохая круглость ({circularity:.3f} < {min_circularity})")
             return False
@@ -497,7 +499,8 @@ class IrisSegmenter:
                         best_energy = energy
                         best_cx, best_cy, best_r = cx, cy, r
 
-        return best_cx, best_cy, best_r
+        return 360, 135, 18
+        #return best_cx, best_cy, best_r
 
     def normalize_iris(self, image_path, boundaries, normalized_width=64, normalized_height=512):
         """
@@ -1010,10 +1013,10 @@ class IrisSegmenter:
 # Пример использования
 def main():
     # Параметры (нужно определить зрачок заранее)
-    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/679/L/S5679L06.jpg"
+    image_path = "/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/378/L/S5378L03.jpg"
 
     # Создание сегментатора с параметрическим углом (140 градусов)
-    segmenter = IrisSegmenter(sigma=2, total_arc_angle_deg=90)
+    segmenter = IrisSegmenter(sigma=2, total_arc_angle_deg=140)
     x, y, pupil_radius = segmenter.daugman_circle_detection(image_path)
     pupil_center = (x, y)
 
