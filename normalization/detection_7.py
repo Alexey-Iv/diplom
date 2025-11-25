@@ -499,8 +499,20 @@ class IrisSegmenter:
         half_angle_rad = np.deg2rad(half_angle_deg)
 
         # Диапазоны поиска
-        r_min = int(pupil_radius * 1.3)
-        r_max = int(min(width, height) * 0.3)
+        if pupil_radius <= 40:
+            coef = 2
+            betta = 3
+        elif 40 < pupil_radius and pupil_radius < 65:
+            coef = 1.4
+            betta = 2
+        else:
+            coef = 1.2
+            betta = 1.9
+
+
+        r_min = int(pupil_radius * coef)
+        r_max = int(betta * pupil_radius)
+        print(f"r_min = {r_min}, r_max = {r_max}")
 
         # Перебор по радиусу и смещению центра
         for r in range(r_min, r_max + 1):
@@ -761,7 +773,7 @@ class IrisSegmenter:
         print("Качество маски хорошее!!")
         return True
 
-    def validate_pupil(self, image_path, pupil_center, pupil_radius, threshold=20):
+    def validate_pupil(self, image_path, pupil_center, pupil_radius):
         """
         Проверяет корректность определения зрачка по средней интенсивности
 
@@ -799,7 +811,7 @@ class IrisSegmenter:
 
         print(avg_intensity)
         # Зрачок должен быть темным, поэтому средняя интенсивность должна быть ниже порога
-        return avg_intensity < threshold
+        return avg_intensity
 
     def daugman_circle_detection(self, image_path, iris_mask=None, use_projections=True):
         """
@@ -834,30 +846,81 @@ class IrisSegmenter:
         # Шаг 3: Выбор метода определения центра
         #if is_mask_valid:
             # Используем маску для поиска центра
-        estimated_center = self.get_pupil_center_from_iris_contours(current_mask)
-        cx_init, cy_init = estimated_center
-        center_range = 20  # Узкий диапазон поиска
-        mask_used = True
-        print(f"Центр зрачка из ВАЛИДНОЙ маски: ({cx_init}, {cy_init})")
 
 
         if use_projections:
             print("Качество маски низкое, используем стандартный метод")
-            # Стандартный метод без маски
-            smoothed = cv2.bilateralFilter(image, 9, 75, 75)
-            region = smoothed[h//4:3*h//4, w//4:3*w//4]
+            # # Стандартный метод без маски
+            # smoothed = cv2.bilateralFilter(image, 9, 75, 75)
+            # region = smoothed[h//4:3*h//4, w//4:3*w//4]
+            #
+            # # Вертикальная проекция (для поиска X) - axis=0
+            # v_proj = np.mean(region, axis=0)
+            # # Горизонтальная проекция (для поиска Y) - axis=1
+            # h_proj = np.mean(region, axis=1)
+            #
+            # cx_init = v_proj.argmin() + w//4  # Ищем минимум (зрачок темный)
+            # cy_init = h_proj.argmin() + h//4
+            # print(f"Центр из проекций: ({cx_init}, {cy_init})")
+            #
+            # center_range = 25  # Стандартный диапазон
 
-            # Вертикальная проекция (для поиска X) - axis=0
-            v_proj = np.mean(region, axis=0)
-            # Горизонтальная проекция (для поиска Y) - axis=1
-            h_proj = np.mean(region, axis=1)
+            img = cv2.imread(image_path)
+            if img is None:
+                raise ValueError("Изображение не найдено")
 
-            cx_init = v_proj.argmin() + w//4  # Ищем минимум (зрачок темный)
-            cy_init = h_proj.argmin() + h//4
-            print(f"Центр из проекций: ({cx_init}, {cy_init})")
+            # Преобразование в оттенки серого
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            center_range = 25  # Стандартный диапазон
-        #
+            # Размытие для уменьшения шума
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+            # Адаптивная бинаризация (инвертированная) для выделения темных областей
+            thresh = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 11, 2
+            )
+
+            # Морфологические операции для удаления шума
+            kernel = np.ones((3, 3), np.uint8)
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)  # Удаление мелких объектов
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel) # Закрытие дыр в объектах
+
+            # Поиск контуров
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            #if not contours:
+            #    return None  # Контур не найден
+
+            # Выбор самого большого контура
+            largest_contour = max(contours, key=cv2.contourArea)
+            #area = cv2.contourArea(largest_contour)
+
+            #print(area)
+            # Проверка минимальной площади (фильтр от шума)
+            #if area < 25:  # Экспериментальный порог
+            #    return None
+
+            # Анализ круглости контура
+            #perimeter = cv2.arcLength(largest_contour, True)
+            #if perimeter == 0:
+            #    return None
+
+            #circularity = 4 * np.pi * area / (perimeter ** 2)
+
+            #print(circularity)
+            # Если контур достаточно круглый (коэффициент близок к 1.0)
+            #if circularity > 0.1:  # Порог подбирается экспериментально
+                # Расчет центра масс контура
+            M = cv2.moments(largest_contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                cx_init = cx
+                cy_init = cy
+
+        print(cx_init, cy_init)
+        #cx_init, cy_init = 313, 130
         # cv2.rectangle(
         #     image,
         #     (cx_init - center_range, cy_init - center_range),
@@ -867,8 +930,10 @@ class IrisSegmenter:
         # )
 
         # Градиенты изображения
-        grad_x, grad_y = self.gaussian_derivative(image, self.sigma)
+        image[image > 180] = 0
+        cv2.imwrite("what.jpg", image)
 
+        grad_x, grad_y = self.gaussian_derivative(image, self.sigma)
         # Параметры поиска
         step_center = 2
         step_radius = 3  # Можно сделать шаг меньше благодаря точной оценке центра
@@ -957,6 +1022,122 @@ class IrisSegmenter:
 
             print(f"Нынешние {best_cx, best_cy, best_r}, Предыдущие {prev_cx, prev_cy}")
 
+        val1 = self.validate_pupil(image_path, (best_cx, best_cy), best_r)
+
+        cx_1 = best_cx
+        cy_1 = best_cy
+        r_1 = best_r
+        print(f"After standard method: {cx_1} {cy_1} {r_1}")
+        print("WOW")
+        print(val1)
+        if val1 > 35:
+            current_mask = self.predict_iris_mask(image_path)
+            estimated_center = self.get_pupil_center_from_iris_contours(current_mask)
+            cx_init, cy_init = estimated_center
+            center_range = 45  # Узкий диапазон поиска
+            mask_used = True
+            print(f"Центр зрачка из ВАЛИДНОЙ маски: ({cx_init}, {cy_init})")
+
+            grad_x, grad_y = self.gaussian_derivative(image, self.sigma)
+
+            # Параметры поиска
+            step_center = 2
+            step_radius = 3  # Можно сделать шаг меньше благодаря точной оценке центра
+
+            best_energy = -np.inf
+            best_cx, best_cy, best_r = cx_init, cy_init, r_min
+
+            # Перебор центров вблизи оцененного (теперь очень маленькая область!)
+            for dx in range(-center_range, center_range+1, step_center):
+                for dy in range(-center_range, center_range+1, step_center):
+                    cx = cx_init + dx
+                    cy = cy_init + dy
+
+                    # Проверка границ
+                    if cx < 0 or cx >= w or cy < 0 or cy >= h:
+                        continue
+
+                    # Перебор радиусов
+                    for r in range(r_min, r_max+1, step_radius):
+                        sample_count = max(360, int(2*np.pi*r))
+                        alpha = np.linspace(0, 2*np.pi, sample_count, endpoint=False)
+                        xs = np.round(cx + r * np.cos(alpha)).astype(int)
+                        ys = np.round(cy + r * np.sin(alpha)).astype(int)
+
+                        # Фильтруем точки внутри изображения
+                        mask = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+                        xs = xs[mask]
+                        ys = ys[mask]
+
+                        if len(xs) == 0:
+                            continue
+
+                        # Вычисление энергии по Daugman
+                        normals = (xs - cx) * grad_x[ys, xs] + (ys - cy) * grad_y[ys, xs]
+                        energy = np.sum(np.abs(normals))
+
+                        if energy > best_energy:
+                            best_energy = energy
+                            best_cx, best_cy, best_r = cx, cy, r
+
+            prev_cx = cx_init
+            prev_cy = cy_init
+
+            #print(abs(best_cx - prev_cx) >= center_range - 1, abs(best_cy - prev_cy) >= center_range - 1)
+            while abs(best_cx - prev_cx) >= center_range - 1 or abs(best_cy - prev_cy) >= center_range - 1:
+                best_energy = -np.inf
+                print("Iteration!")
+
+                prev_cx, prev_cy = best_cx, best_cy
+
+                # Перебор центров вблизи оцененного (теперь очень маленькая область!)
+                for dx in range(-center_range, center_range+1, step_center):
+                    for dy in range(-center_range, center_range+1, step_center):
+                        cx = cx_init + dx
+                        cy = cy_init + dy
+
+                        # Проверка границ
+                        if cx < 0 or cx >= w or cy < 0 or cy >= h:
+                            continue
+
+                            # Перебор радиусов
+                        for r in range(r_min, r_max+1, step_radius):
+                            sample_count = max(360, int(2*np.pi*r))
+                            alpha = np.linspace(0, 2*np.pi, sample_count, endpoint=False)
+                            xs = np.round(cx + r * np.cos(alpha)).astype(int)
+                            ys = np.round(cy + r * np.sin(alpha)).astype(int)
+
+                            # Фильтруем точки внутри изображения
+                            mask = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+                            xs = xs[mask]
+                            ys = ys[mask]
+
+                            if len(xs) == 0:
+                                continue
+
+                            # Вычисление энергии по Daugman
+                            normals = (xs - cx) * grad_x[ys, xs] + (ys - cy) * grad_y[ys, xs]
+                            energy = np.sum(np.abs(normals))
+
+                            if energy > best_energy:
+                                best_energy = energy
+                                best_cx, best_cy, best_r = cx, cy, r
+
+                if (best_cx - prev_cx) == 0 and (best_cy - prev_cy) == 0:
+                    break
+
+            print(f"Нынешние после модели {best_cx, best_cy, best_r}, Предыдущие {prev_cx, prev_cy}")
+
+        # val2 = self.validate_pupil(image_path, (best_cx, best_cy), best_r)
+        #
+        # if val1 < val2:
+        #     best_cx = cx_1
+        #     best_cy = cy_1
+        #     best_r = r_1
+        #return 432, 307, 32  #<---- 760L00
+        #return 331, 124, 25    #<----- 760L02
+        #return 313, 130, 25
+        #return 357, 180, 25     #<-----760L03
         return best_cx, best_cy, best_r
 
     def normalize_iris(self, image_path, boundaries, normalized_width=64, normalized_height=512):
@@ -1232,16 +1413,28 @@ class IrisSegmenter:
                         pbar.set_description(f"Обработка: {subject_id}/{eye_type}/{img_name}")
 
                         # Сегментация
-                        x, y, pupil_radius = self.daugman_circle_detection(img_path)
+                        x_mask, y_mask, pupil_radius_mask = self.daugman_circle_detection(img_path)
 
-                        pupil_center = (x, y)
+                        pupil_center_mask = (x_mask, y_mask)
 
                         # Проверяем корректность зрачка перед сегментацией
-                        if not self.validate_pupil(img_path, pupil_center, pupil_radius):
-                            print(f"Зрачок не прошел валидацию для {img_path}, пропускаем")
-                            pbar.update(1)
-                            continue
-
+                        #val1 = self.validate_pupil(img_path, pupil_center_mask, pupil_radius_mask):
+                        # if val1 > 20:
+                        #     print(f"Зрачок не прошел валидацию для {img_path}, пропускаем")
+                        #     x_proj, y_proj, pupil_radius_proj = self.daugman_circle_detection(img_path, use_projections=True)
+                        #
+                        #     pupil_center_proj = (x_proj, y_proj)
+                        #
+                        #     val2 = self.validate_pupil(img_path, pupil_center_proj, pupil_radius_proj)
+                        #
+                        #     if val1 <= val2:
+                        #         pupil_center = pupil_center_mask
+                        #         pupil_radius = pupil_radius_mask
+                        #     else:
+                        #         pupil_center = pupil_center_proj
+                        #         pupil_radius = pupil_radius_proj
+                        pupil_center = pupil_center_mask
+                        pupil_radius = pupil_radius_mask
                         # Сегментация
                         segmented, mask, boundaries = self.segment_iris(img_path, pupil_center, pupil_radius)
 
@@ -1300,7 +1493,7 @@ def parse_arguments():
                        help='Путь к файлу весов модели (.pth)')
 
     parser.add_argument('--image_path', type=str,
-                       default='/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/528/L/S5528L00.jpg',
+                       default='/home/flex/Desktop/Diplom/diplom/datasets/CASIA-Iris-Thousand/760/L/S5760L02.jpg',
                        help='Путь к изображению для обработки')
 
     parser.add_argument('--input_dir', type=str, default='./CASIA-TH-ALL',
