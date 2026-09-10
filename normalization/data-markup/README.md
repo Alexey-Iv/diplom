@@ -15,7 +15,7 @@ The tool also supports eyelid annotation.
 > python markup.py --mode circles --input-dir ./images --output-dir ./output
 ```
 
-[Example of usage](image_markup_iris.jpg)
+!(image_markup_iris.jpg)
 
 
 ### Arguments
