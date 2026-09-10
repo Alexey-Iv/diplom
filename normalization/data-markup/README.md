@@ -5,10 +5,47 @@
 ## Markup
 `markup.py` is a tool for manually annotating iris images.
 
+The application provides two main windows:
+ - Annotator — the main annotation window where you place and edit annotation points directly on the image.
+ - Magnifier — a separate magnification window that acts like a loupe. It shows an enlarged region around the cursor so you can place annotation points as precisely as possible.
+
+
 You can use it to annotate the **pupil** and **iris** by selecting **3 points for each circle**. The script calculates the corresponding circle center and radius automatically from these points.
 
 The tool also supports eyelid annotation.
 
+### Interface
+    - Annotator
+The Annotator is the main working window.
+It displays the current eye image and allows you to:
+        - place annotation points;
+        - drag already placed points;
+        - zoom in and out;
+        - move the visible image area while zoomed in;
+        - inspect predicted pupil and iris circles when a YOLO model is provided;
+        - move smoothly from one image to the next without reopening the application window.
+
+
+When annotating circles, you place:
+        - 3 points on the pupil boundary;
+        - 3 points on the iris boundary.
+
+
+The program then calculates both circles automatically.
+### Magnifier
+    - The Magnifier is an additional window designed for precise point placement.
+
+It works like a digital loupe and displays a highly enlarged crop of the original image around the current cursor position.
+This is especially useful when:
+        - the iris boundary is difficult to distinguish;
+        - the pupil edge is blurred;
+        - eyelashes or reflections are close to the boundary;
+        - you need pixel-level precision when placing or adjusting points.
+
+The magnifier uses the original image data rather than simply enlarging the already scaled Annotator view. This makes it easier to inspect fine image details accurately.
+You can use the Annotator for general navigation and the Magnifier for final precise point placement.
+
+ 
 ### Usage
 
 ```bash
