@@ -60,6 +60,52 @@ You can use the Annotator for general navigation and the Magnifier for final pre
 
 ![Example of usage](./image_markup_iris.jpg)
 
+### Controls
+
+#### Mouse controls
+
+- **Left Mouse Button (LMB)** — place a new annotation point.
+- **LMB on an existing point** — drag and adjust the selected point.
+- **Mouse Wheel** — zoom in or out around the current cursor position.
+- **Right Mouse Button (RMB) + drag** — move the visible image area while zoomed in.
+- **Middle Mouse Button (MMB) + drag** — alternative way to pan the image.
+- **Shift + LMB + drag** — alternative panning control.
+
+#### Keyboard controls
+
+- **Enter** — save the current annotation and move to the next image.
+- **U** — undo the last placed point.
+- **R** — reset all annotation points on the current image.
+- **N** — skip the current image.
+- **Q** or **Esc** — quit the annotation tool.
+- **`+` / `=`** — zoom in.
+- **`-`** — zoom out.
+- **`0`** — reset the view and fit the image to the Annotator window.
+- **`1`** — switch to a 1:1 pixel view.
+- **`F`** — toggle fullscreen mode.
+
+#### Magnifier controls
+
+The **Magnifier** follows the cursor position in the Annotator and displays an enlarged crop from the original image.
+
+Use it when the pupil or iris boundary is difficult to distinguish or when pixel-level point placement is required.
+
+- Move the cursor over the image to inspect a region in the Magnifier.
+- Use **`[`** to decrease Magnifier zoom.
+- Use **`]`** to increase Magnifier zoom.
+- The Magnifier can be used while placing or adjusting annotation points.
+
+#### Recommended workflow
+
+1. Open an image in the **Annotator**.
+2. Zoom into the eye region using the mouse wheel.
+3. Pan the image if the required boundary is outside the current view.
+4. Use the **Magnifier** to inspect the exact pupil or iris boundary.
+5. Place or adjust the annotation point.
+6. Repeat until all required points are placed.
+7. Press **Enter** to save the annotation and continue to the next image.
+
+The Annotator keeps the working view between images, which makes it possible to annotate a sequence of similar images without repeatedly resetting the zoom and camera position.
 
 ### Arguments
 
