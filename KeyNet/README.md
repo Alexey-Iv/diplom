@@ -1,161 +1,1011 @@
-# Исправления обучения KeyNet
+# KeyNet Keypoint Detector Training
 
-Отдельный проект **только для обучения и оценки детектора KeyNet** из присланного `keynet-main.zip`. Здесь сохранены вычисления исходного 10-канального baseline, имена обучаемых слоёв и совместимость приложенного `keyNet.pt`. Это более узкая работа, чем прежний архив `iris-training-casia.zip`: для текущей задачи используйте именно эту папку.
+This repository contains a research-oriented training pipeline for the **KeyNet** keypoint detector. The project is intentionally limited to detector training and detector evaluation. Identity classification, descriptor extraction, and a complete iris-recognition system are outside its scope.
 
-**KeyNet обучается без меток классов.** Для обучения нужна пара «исходное изображение — преобразованное изображение» и известное преобразование. Идентификаторы людей здесь нужны только для разделения данных, а не для классификационной функции потерь.
+Training is self-supervised. For every input image, the dataset generates a synthetically transformed version and keeps the known geometry between the two views. That geometry is then used by the MSIP loss and by the repeatability metric.
 
-Проверки выполнены на CPU и искусственных данных. Обучения на реальном CASIA в этой поставке нет, поэтому улучшение качества на нём не заявляется.
+> Important: the included smoke tests validate the training pipeline on synthetic data. They are not CASIA training runs and should not be reported as a CASIA benchmark.
 
-## Что исправлено
+---
 
-- Явные `train()` и `eval()`; validation не обновляет BatchNorm.
-- Строгая загрузка всех обучаемых параметров и BN-статистик. Несовместимые слои больше не пропускаются.
-- Явное расширение первого слоя 10→14: старые каналы копируются, новые зануляются, после этого все каналы обучаются.
-- Разные sigma в фильтрах Эрмита теперь задают разные пространственные формы; фиксированные фильтры сохраняются и перемещаются как buffers.
-- Сохранена IP-формула `exp(score / max_in_window) - 1`; исправлены обработка видимости и нормировка весов по отдельным изображениям.
-- Validation повторяемости использует именно расстояние в пикселях и взаимно-однозначные соответствия. Порог по умолчанию — 3px.
-- Данные разделяются по людям, пути/контрольные суммы сохраняются в manifest; пары обновляются по эпохам, validation фиксирована.
-- Случайные кропы вместо единственного центрального патча; `.bmp/.png/.jpg/.jpeg`; нет старого ограничивающего кэша.
-- Маски окклюзий передаются с изображениями. Искусственные границы исключаются из loss/NMS и не закрашиваются во входе сети.
-- Полное resume: модель, optimizer, scheduler, RNG и номер эпохи. Исходная модель до обучения тоже участвует в выборе `best.pt`.
+## Contents
 
-Подробное объяснение причин: [docs/KEYNET_REVIEW_RU.md](docs/KEYNET_REVIEW_RU.md). Проверки и ограничения: [docs/VALIDATION.md](docs/VALIDATION.md).
+- [What the project does](#what-the-project-does)
+- [Project layout](#project-layout)
+- [Installation](#installation)
+- [Preparing the data](#preparing-the-data)
+- [Inspecting training pairs](#inspecting-training-pairs)
+- [Running the smoke test](#running-the-smoke-test)
+- [Training the baseline](#training-the-baseline)
+- [Hermite variant](#hermite-variant)
+- [Training from scratch](#training-from-scratch)
+- [Iris-shift geometry](#iris-shift-geometry)
+- [Resuming training](#resuming-training)
+- [Evaluating a model](#evaluating-a-model)
+- [Output files](#output-files)
+- [Main command-line options](#main-command-line-options)
+- [How the loss and repeatability are computed](#how-the-loss-and-repeatability-are-computed)
+- [Reproducibility](#reproducibility)
+- [Common problems](#common-problems)
+- [Limitations](#limitations)
+- [Compatibility note for evaluate.py](#compatibility-note-for-evaluatepy)
 
-## Установка
+---
 
-Python 3.11+; локальная проверка выполнена на Python 3.12. Создайте отдельное окружение:
+## What the project does
+
+The pipeline has five main stages:
+
+1. Build a manifest with subject-disjoint `train`, `val`, and `test` splits.
+2. Generate self-supervised pairs:
+   - source patch;
+   - geometrically transformed patch;
+   - source and transformed masks;
+   - homography matrix `H`.
+3. Train KeyNet with MSIP loss.
+4. Validate the detector using keypoint repeatability.
+5. Save `best.pt`, `last.pt`, logs, and diagnostic images.
+
+Subject IDs are used only to prevent subject leakage between splits. Identity labels are not used by the detector loss.
+
+---
+
+## Project layout
+
+The filenames below match the current project version.
+
+```text
+project/
+├── data.py
+├── geometry.py
+├── checkpoints.py
+├── train_utils.py
+├── train.py
+├── inspect_pairs.py
+├── evaluate.py
+├── smoke.py
+├── keyNet/
+│   ├── model/
+│   │   └── keynet_architecture.py
+│   ├── loss/
+│   │   └── score_loss_function.py
+│   └── pretrained_nets/
+│       └── keyNet.pt
+├── requirements.txt
+└── runs/
+```
+
+### File responsibilities
+
+**`data.py`**
+
+- builds the manifest;
+- extracts subject IDs from paths or a metadata CSV;
+- performs subject-disjoint splitting;
+- loads images and optional masks;
+- samples random crops;
+- generates affine or `iris-shift` geometry;
+- returns source/transformed training pairs.
+
+**`geometry.py`**
+
+Implements:
+
+- point transformation by homography;
+- image warping with `grid_sample`;
+- border masking;
+- mask erosion.
+
+**`checkpoints.py`**
+
+Strictly imports pretrained weights and checks architecture compatibility.
+
+It also supports the explicit 10-to-14 input-channel expansion used by the Hermite variant.
+
+**`train_utils.py`**
+
+Contains:
+
+- deterministic seeding;
+- train/eval mode handling;
+- score-map forward pass;
+- one training epoch;
+- keypoint NMS;
+- repeatability;
+- validation.
+
+**`keyNet/loss/score_loss_function.py`**
+
+Implements the multi-scale MSIP loss on positive score maps.
+
+**`train.py`**
+
+Main training entry point:
+
+- parses arguments;
+- creates data loaders;
+- builds KeyNet;
+- handles initialization and resume;
+- runs training and validation;
+- writes checkpoints and logs.
+
+**`inspect_pairs.py`**
+
+Visualizes the actual image/target/mask pairs used by the training loader.
+
+**`evaluate.py`**
+
+Runs detector-only validation or test evaluation and saves metrics and keypoint previews.
+
+**`smoke.py`**
+
+Creates a small synthetic dataset and exercises:
+
+- baseline initialization;
+- Hermite 10-to-14 expansion;
+- `iris-shift`;
+- scratch training with `softplus`;
+- resume;
+- equality between resumed and uninterrupted training;
+- `best.pt` selection including the pre-training baseline.
+
+---
+
+## Installation
+
+A dedicated virtual environment is recommended.
+
+### Linux / macOS
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-# Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
+```
+
+### Windows PowerShell
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+If PyTorch is not included in `requirements.txt`, install the appropriate build separately.
+
+CPU example:
+
+```bash
+python -m pip install torch
+```
+
+For GPU training, install a PyTorch build compatible with your CUDA environment.
+
+Check CUDA visibility with:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+---
+
+## Preparing the data
+
+The project expects already prepared grayscale images.
+
+For an iris experiment, these would normally be normalized iris strips rather than raw full-eye photographs.
+
+Example layout:
+
+```text
+data/
+├── normalized/
+│   ├── 000/
+│   │   ├── L/
+│   │   │   ├── 00.png
+│   │   │   ├── 01.png
+│   │   │   └── 02.png
+│   │   └── R/
+│   └── 001/
+└── masks/
+    ├── 000/
+    │   ├── L/
+    │   │   ├── 00.png
+    │   │   ├── 01.png
+    │   │   └── 02.png
+    │   └── R/
+    └── 001/
+```
+
+A mask must:
+
+- have the same spatial size as the corresponding image;
+- be binary;
+- use `0` for invalid regions;
+- use `1` or `255` for valid regions;
+- be stored as PNG.
+
+### Automatic subject extraction
+
+The current parser supports naming patterns such as:
+
+```text
+S5000L00.jpg
+000_L_01.png
+000/L/01.png
+```
+
+For a different layout, provide a CSV file:
+
+```csv
+path,subject
+000/L/01.png,000
+000/L/02.png,000
+001/R/01.png,001
+```
+
+### Build a manifest with masks
+
+```bash
+python data.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json
+```
+
+### Without masks
+
+```bash
+python data.py \
+  --data-dir data/normalized \
+  --manifest data/split_no_masks.json
+```
+
+### With explicit metadata
+
+```bash
+python data.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --metadata data/subjects.csv
+```
+
+The manifest is intentionally not overwritten. If the path already exists, `data.py` exits with an error so an existing split is not silently replaced.
+
+### Split logic
+
+Subjects are shuffled with a fixed seed.
+
+The current implementation assigns approximately:
+
+- 15% of subjects to `test`;
+- 15% to `val`;
+- the remainder to `train`.
+
+All images from the same subject stay in the same split.
+
+---
+
+## Inspecting training pairs
+
+Before a real training run, inspect what the dataset loader is actually producing.
+
+```bash
+python inspect_pairs.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/pairs
+```
+
+This creates:
+
+```text
+runs/pairs/
+├── pairs.png
+└── pairs.json
+```
+
+`pairs.png` shows:
+
+```text
+source | transformed | source mask | transformed mask
+```
+
+`pairs.json` records the valid fraction and the number of fully visible MSIP windows at every configured scale.
+
+If almost every window count is zero, fix the mask, crop size, border, or augmentation before starting a full training run.
+
+---
+
+## Running the smoke test
+
+The smoke test checks the training pipeline itself.
+
+```bash
 python smoke.py --out runs/smoke
 ```
 
-Для GPU вместо CPU-пакета установите совместимую CUDA-сборку PyTorch и укажите `--device cuda:0`. GPU-исполнение здесь не проверялось. Для CPU используется `--device cpu`. Дополнительные библиотеки для дескрипторов/других нейросетей не требуются.
+`runs/smoke` must be a fresh directory.
 
-В `keyNet/pretrained_nets/keyNet.pt` сохранён **тот же файл весов, который был в вашем исходном архиве**. Это не новые обученные на CASIA веса.
+The script runs several very short training variants and also checks resume behavior.
 
-## 1. Подготовка данных
-
-Ожидается папка уже подготовленных изображений. Для вашего исследования — нормализованные полосы радужек, не полные необработанные фотографии глаз. Эта версия не обучает сегментатор и не строит нормализацию из сырых кадров.
-
-Примеры относительных путей:
+A successful run writes:
 
 ```text
-data/normalized/000/L/01.png
-data/normalized/000/R/01.png
-data/masks/000/L/01.png
-data/masks/000/R/01.png
+runs/smoke/summary.json
 ```
 
-Маски: 1 или 255 — видимая ткань радужки, 0 — окклюзии/блики/невалидная область. Размер маски совпадает с изображением. Расширение маски всегда PNG. Никакого дополнительного входного канала маски к KeyNet автоматически не добавляется.
+Example:
 
-Имена `S5000L00.jpg`, `000_L_01.png` или каталоги `000/L/...` распознаются. Для других имён подготовьте CSV `path,subject` и передайте `--metadata`. Subject не используется в loss.
+```json
+{
+  "status": "passed",
+  "casia_trained": false,
+  "variants": [
+    "baseline",
+    "hermite",
+    "iris-shift",
+    "scratch-softplus"
+  ],
+  "steps_per_mini_epoch": 2,
+  "resume_max_error": 0.0
+}
+```
 
-С масками:
+`casia_trained: false` is deliberate: the smoke test does not train on CASIA.
+
+---
+
+## Training the baseline
+
+To fine-tune the supplied pretrained checkpoint:
 
 ```bash
-python data.py --data-dir data/normalized --mask-dir data/masks --manifest data/split.json
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/baseline \
+  --init keyNet/pretrained_nets/keyNet.pt \
+  --device cuda:0
 ```
 
-Для исходного опыта без масок:
+CPU example:
 
 ```bash
-python data.py --data-dir data/normalized --manifest data/split_no_masks.json
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/baseline_cpu \
+  --init keyNet/pretrained_nets/keyNet.pt \
+  --device cpu
 ```
 
-Разделение примерно 70/15/15 по людям; оба глаза одного человека остаются в одной части. На полном CASIA это 700/150/150 субъектов. Числа сами по себе не являются единственно верным split: важны фиксация и отсутствие пересечений. Старые 65/20/15 из диплома или 70/10/20 из кода автоматически не воспроизводятся.
+If `runs/baseline/last.pt` already exists, a new non-resume run is rejected. Use `--resume` or choose another output directory.
 
-Manifest не перезаписывается. Если вы изменили изображения или маски, создайте новый manifest и новый эксперимент. При переносе дерева на другой компьютер относительные пути сохраняются.
+---
 
-## 2. Сначала посмотреть обучающие пары
+## Hermite variant
+
+The Hermite branch expands the first trainable layer from 10 to 14 input channels.
+
+To initialize it from the old 10-channel checkpoint, explicitly request the expansion:
 
 ```bash
-python inspect_pairs.py --data-dir data/normalized --mask-dir data/masks --manifest data/split.json --out runs/pairs
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/hermite \
+  --init keyNet/pretrained_nets/keyNet.pt \
+  --hermite \
+  --expand-input \
+  --device cuda:0
 ```
 
-`pairs.png`: исходный кроп | преобразованный кроп | исходная маска | преобразованная маска. В `pairs.json` — число полностью видимых окон каждого размера. Это первые 16 train-изображений, диагностический просмотр, а не репрезентативная оценка качества.
+The expansion is explicit:
 
-Если для всех размеров окон получается 0, обучение запускать рано: нужно проверить направление маски, размер кропа, ширину border и реальную видимость ткани. Код не будет подставлять случайные координаты в полностью закрытые окна.
+- the first 10 input channels are copied from the checkpoint;
+- the four new channels are initialized to zero;
+- training then updates the full model normally.
 
-## 3. Дообучение baseline
+Checkpoint loading is strict. Incompatible layers are not silently skipped.
+
+---
+
+## Training from scratch
+
+If `--init` is omitted, the model uses the architecture's current initialization.
+
+A useful separate experiment is `softplus` score activation:
 
 ```bash
-python train.py --data-dir data/normalized --mask-dir data/masks --manifest data/split.json --out runs/baseline --init keyNet/pretrained_nets/keyNet.pt --device cuda:0
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/from_scratch \
+  --score-activation softplus \
+  --device cuda:0
 ```
 
-Без масок опустите `--mask-dir` и используйте соответствующий manifest. Для контролируемого отключения уже имеющихся масок есть `--ignore-masks` — это отдельный ablation с новым `--out`.
+This should be treated as its own experiment. With random initialization, ReLU can produce completely inactive score maps and therefore zero gradients.
 
-Сохраняются оригинальные 10 handcrafted каналов, три масштаба, learned conv 5×5, последний conv 1×1 и оригинальная предобработка внутри модели. Прямой forward baseline на одинаковом тензоре проверен против исходной архитектуры: максимальная разница 0.0 в проверенном CPU-примере.
+---
 
-**Стартовые настройки обучения изменены и не объявляются оптимальными:** patch=64, border=4, окна 8/16/24, learning rate=1e-4. В исходнике patch=50 и border=16 оставляли мало пригодной области. Для контролируемого сравнения явно задавайте параметры и меняйте один фактор за раз.
+## Iris-shift geometry
 
-Полезные параметры:
+The default mode is:
+
+```text
+--geometry affine
+```
+
+The affine generator can use:
+
+- rotation;
+- scale;
+- shear;
+- horizontal translation;
+- vertical translation.
+
+For normalized iris strips, a simpler horizontal-shift experiment is available:
 
 ```bash
---patch-size 64 --border 4 --windows 8,16,24 --factors 256,64,16
---lr 0.0001 --batch-size 8 --epochs 30 --seed 42
---max-angle 3 --max-scale 1.0 --max-shear 0.0 --max-shift 3
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/iris_shift \
+  --init keyNet/pretrained_nets/keyNet.pt \
+  --geometry iris-shift \
+  --device cuda:0
 ```
 
-Изображение должно быть не меньше patch_size по обеим осям; равный размер разрешён. Из длинной полосы каждый раз выбирается новый горизонтальный участок. Для обычной аффинной синтетики используется `--geometry affine`. Для развёртки можно сравнить `--geometry iris-shift`: в этом режиме применяется только горизонтальный сдвиг кропа. Области, вышедшие за кроп, исключаются по видимости; это не полная модель циклической полосы или дилатации зрачка.
+In `iris-shift` mode:
 
-Веса scale loss теперь нормированы, поэтому численный loss отличается от старого. Старый learning rate и график loss не следует переносить без проверки градиентов/validation.
+- angle = 0;
+- scale = 1;
+- shear = 0;
+- vertical translation = 0;
+- horizontal translation remains active.
 
-## 4. Вариант с Эрмитом
+This is a simplified geometry model, not a complete physical model of iris deformation.
+
+---
+
+## Resuming training
+
+`last.pt` stores:
+
+- model weights;
+- optimizer state;
+- scheduler state;
+- current epoch;
+- best validation score;
+- CPU RNG state;
+- CUDA RNG state.
+
+Example: continue the same run to 60 epochs.
 
 ```bash
-python train.py --data-dir data/normalized --mask-dir data/masks --manifest data/split.json --out runs/hermite --hermite --init keyNet/pretrained_nets/keyNet.pt --expand-input --device cuda:0
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/baseline \
+  --resume runs/baseline/last.pt \
+  --epochs 60 \
+  --device cuda:0
 ```
 
-При инициализации новые 4 входных канала зануляются в весах первого обучаемого слоя. Поэтому перед дообучением выход совпадает с baseline, а полезность новых признаков затем определяется обучением. Градиенты новых каналов проверены. Без `--expand-input` несовпадение 10/14 завершает запуск понятной ошибкой.
+`--init` and `--resume` are mutually exclusive.
 
-Предыдущие **14-канальные** weights со старой формой Hermite-фильтров нельзя автоматически считать совместимыми по смыслу только из-за совпадения tensor shapes. Их фиксированные фильтры не сохранялись в старом checkpoint. Для этой ветви используйте приведённый 10→14 путь либо обучение с нуля; см. отчёт.
+Resume also checks that the relevant experiment configuration is unchanged.
 
-## 5. Обучение с нуля
+For a Hermite run, keep `--hermite` when resuming, but do not repeat `--expand-input`.
 
-Для отдельного эксперимента можно использовать плавную положительную активацию:
+---
+
+## Evaluating a model
+
+Detector-only evaluation is performed with `evaluate.py`.
+
+Example:
 
 ```bash
-python train.py --data-dir data/normalized --mask-dir data/masks --manifest data/split.json --out runs/from_scratch --score-activation softplus --device cuda:0
+python evaluate.py \
+  --checkpoint runs/baseline/best.pt \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --split test \
+  --out runs/test_baseline \
+  --device cuda:0
 ```
 
-`softplus` — явно обозначенная вариация. По умолчанию остаётся `relu`, как в исходном цикле. ReLU при неудачной случайной инициализации может дать пустые карты и нулевые градиенты. Если сравниваете эти варианты, не меняйте одновременно геометрию, размер патча и split.
+This creates:
 
-## 6. Логи и продолжение
+```text
+runs/test_baseline/
+├── metrics.json
+└── keypoints.png
+```
 
-В каждом `--out`:
+`metrics.json` contains repeatability and diagnostic statistics.
 
-- `before_training.json` — validation до первого optimizer step;
-- `history.jsonl` — loss, положительная доля logits, норма градиента, число валидных окон, repeatability, количество точек, learning rate;
-- `best.pt` — лучший результат, включая исходную модель с `best_epoch=-1`, если дообучение не улучшило её;
-- `last.pt` — последняя эпоха с полным состоянием обучения;
-- `config.json`, `environment.json` — параметры и окружение.
+`keypoints.png` shows detected points. Invalid mask regions are darkened with a red tint and keypoints are drawn as yellow circles.
 
-Продолжение требует тех же существенных аргументов, кроме увеличения числа эпох и замены `--init` на `--resume`:
+This is a detector evaluation. It is not an identity-recognition accuracy measurement.
+
+---
+
+## Output files
+
+A normal training run writes the following files under `--out`.
+
+### `config.json`
+
+The experiment configuration.
+
+### `environment.json`
+
+Basic environment information:
+
+- Python version;
+- PyTorch version;
+- device.
+
+### `before_training.json`
+
+Validation result before the first optimizer step.
+
+This matters for fine-tuning because the initial pretrained model can remain better than all later epochs.
+
+### `history.jsonl`
+
+One JSON object per epoch.
+
+It includes values such as:
+
+- training loss;
+- fraction of positive raw logits;
+- gradient norm;
+- number of valid MSIP windows;
+- validation loss;
+- repeatability;
+- mean number of detected points;
+- number of empty pairs;
+- learning rate.
+
+### `last.pt`
+
+The most recent complete training state.
+
+Use it with `--resume`.
+
+### `best.pt`
+
+The checkpoint with the highest `val_repeatability_px`.
+
+The pre-training model also participates in model selection, so:
+
+```text
+best_epoch = -1
+```
+
+is valid. It means fine-tuning did not improve the starting checkpoint on validation.
+
+---
+
+## Main command-line options
+
+### Data
+
+| Option | Meaning |
+|---|---|
+| `--data-dir` | Root directory containing images |
+| `--mask-dir` | Root directory containing masks |
+| `--manifest` | Split manifest |
+| `--ignore-masks` | Ignore masks even when provided |
+
+### Training
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--epochs` | `30` | Number of epochs |
+| `--batch-size` | `8` | Batch size |
+| `--lr` | `1e-4` | Learning rate |
+| `--grad-clip` | `5.0` | Gradient clipping threshold |
+| `--seed` | `42` | Random seed |
+| `--threads` | `4` | CPU threads |
+| `--device` | `cpu` | `cpu`, `cuda:0`, ... |
+| `--max-steps` | unset | Limit batches per epoch for smoke/debug runs |
+
+### Crop and border
+
+| Option | Default |
+|---|---:|
+| `--patch-size` | `64` |
+| `--border` | `4` |
+
+Constraints:
+
+```text
+patch_size >= 32
+border >= 0
+2 * border < patch_size
+```
+
+### Geometry
+
+| Option | Default |
+|---|---:|
+| `--geometry` | `affine` |
+| `--max-angle` | `3.0` |
+| `--max-scale` | `1.0` |
+| `--max-shear` | `0.0` |
+| `--max-shift` | `3.0` |
+
+### MSIP
+
+| Option | Default |
+|---|---|
+| `--windows` | `8,16,24` |
+| `--factors` | `256,64,16` |
+| `--coordinate-weighting` | `True` |
+
+`windows` and `factors` must have the same length.
+
+### Validation / keypoints
+
+| Option | Default |
+|---|---:|
+| `--topk` | `25` |
+| `--nms-size` | `5` |
+| `--pixel-threshold` | `3.0` |
+
+`nms-size` must be a positive odd integer.
+
+### Architecture
+
+| Option | Default |
+|---|---:|
+| `--num-filters` | `8` |
+| `--num-learnable-blocks` | `3` |
+| `--num-levels-within-net` | `3` |
+| `--factor-scaling-pyramid` | `1.5` |
+| `--conv-kernel-size` | `5` |
+
+`conv-kernel-size` must be odd.
+
+---
+
+## How the loss and repeatability are computed
+
+### Score maps
+
+Before an image is passed through KeyNet, invalid pixels are replaced by a neutral value:
+
+```python
+image = image * mask + 0.5 * (1 - mask)
+```
+
+The mask is not automatically concatenated as an additional network input channel.
+
+Raw scores are converted to a positive map using either:
+
+```text
+ReLU
+```
+
+or:
+
+```text
+Softplus
+```
+
+### MSIP
+
+At every configured scale, for example:
+
+```text
+8 x 8
+16 x 16
+24 x 24
+```
+
+the score map is split into windows.
+
+The proposal inside a window keeps the positive-map formulation based on:
+
+```text
+exp(score / window_max) - 1
+```
+
+Only fully visible windows contribute to the loss.
+
+The loss is symmetric:
+
+```text
+source -> transformed
+transformed -> source
+```
+
+If one direction has no valid windows, it does not dilute the valid direction.
+
+### Repeatability
+
+Validation:
+
+1. performs NMS;
+2. keeps at most `topk` points;
+3. maps source points through `H`;
+4. computes pairwise distances;
+5. finds a maximum one-to-one matching;
+6. reports the fraction of matches within `pixel-threshold`.
+
+The default threshold is:
+
+```text
+3 px
+```
+
+Repeatability is reported in `[0, 1]`.
+
+---
+
+## Reproducibility
+
+`fix_randseed()` seeds:
+
+- Python `random`;
+- NumPy;
+- PyTorch;
+- CUDA.
+
+cuDNN deterministic mode is also enabled:
+
+```python
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+```
+
+For training samples, random crop generation depends on:
+
+```text
+seed + index + 1_000_003 * epoch
+```
+
+Validation and test pairs stay fixed because the epoch term is not applied to those splits.
+
+The training DataLoader generator is also reseeded with:
+
+```text
+seed + epoch
+```
+
+This is part of making resumed training reproduce uninterrupted training.
+
+---
+
+## Common problems
+
+### `Run exists; use --resume or new --out`
+
+The selected output directory already contains `last.pt`.
+
+Either resume it:
 
 ```bash
-python train.py --data-dir data/normalized --mask-dir data/masks --manifest data/split.json --out runs/baseline --resume runs/baseline/last.pt --epochs 60 --device cuda:0
+--resume runs/.../last.pt
 ```
 
-Для Hermite-run сохраняйте `--hermite`, а `--expand-input` повторно не указывайте. `--max-steps 2` ограничивает число batch для проверки запуска и помечает результат `smoke_only`; для настоящего обучения флаг не задаётся.
+or use a new `--out`.
 
-## 7. Проверка детектора на test
+### `No valid MSIP windows`
+
+Check:
+
+- masks;
+- patch size;
+- border width;
+- MSIP window sizes;
+- augmentation strength;
+- score-map activity.
+
+Run `inspect_pairs.py` first.
+
+### `Zero gradient`
+
+A ReLU score map can become completely inactive.
+
+For a separate scratch experiment, try:
+
+```text
+--score-activation softplus
+```
+
+### 10-vs-14 channel mismatch
+
+A Hermite fine-tuning run from the old checkpoint requires:
+
+```text
+--hermite --expand-input
+```
+
+### `Image smaller than patch_size`
+
+At least one image dimension is smaller than `--patch-size`.
+
+Reduce the patch size or preprocess the images accordingly.
+
+### `Subject leakage`
+
+A subject appears in more than one split.
+
+Fix the manifest or metadata.
+
+### `Manifest already exists`
+
+The manifest is intentionally not overwritten.
+
+Use a new filename, for example:
+
+```text
+data/split_v2.json
+```
+
+---
+
+## Limitations
+
+This repository should be interpreted as a detector training/evaluation pipeline.
+
+It does not provide:
+
+- iris segmentation;
+- normalization of raw eye photographs;
+- descriptor extraction;
+- matching between real different captures;
+- biometric identification or verification;
+- a complete CASIA benchmark.
+
+Synthetic repeatability is useful for studying detector stability under known geometry, but it is not by itself evidence of improved real biometric matching.
+
+When comparing experiments, keep the following fixed unless they are the variable being studied:
+
+- manifest;
+- train/val/test split;
+- seeds;
+- number of keypoints;
+- geometry;
+- initialization;
+- masks;
+- evaluation threshold.
+
+Changing several factors at once makes attribution of the result unreliable.
+
+---
+
+## Compatibility note for `evaluate.py`
+
+The supplied `evaluate.py` contains:
+
+```python
+digest(a.manifest) != ck["config"]["manifest_sha256"]
+```
+
+and imports:
+
+```python
+from data import Pairs, digest
+```
+
+However, in the supplied `data.py`, `digest()` is not present, and the current `train.py` stores:
+
+```text
+manifest_path
+manifest_mtime
+```
+
+rather than `manifest_sha256`.
+
+These pieces therefore need to be synchronized before relying on `evaluate.py`.
+
+There are two reasonable approaches.
+
+### Option 1 — restore SHA-256 validation
+
+Add `digest()` to `data.py` and store `manifest_sha256` in `train.py`.
+
+This is the stricter solution because evaluation verifies manifest contents, not only a path or modification time.
+
+### Option 2 — use the current training metadata
+
+Remove the SHA-256 dependency from `evaluate.py` and validate the manifest using the same scheme used by `train.py`.
+
+Do not keep the current mixed implementation: in that state, `evaluate.py` can fail before model evaluation starts.
+
+---
+
+## Recommended workflow
+
+A typical experiment can follow this order:
 
 ```bash
-python evaluate.py --checkpoint runs/baseline/best.pt --data-dir data/normalized --mask-dir data/masks --manifest data/split.json --split test --out runs/test_baseline --device cuda:0
+# 1. Build the split
+python data.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json
+
+# 2. Inspect the generated pairs
+python inspect_pairs.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/pairs
+
+# 3. Check the training pipeline
+python smoke.py --out runs/smoke
+
+# 4. Train the baseline
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/baseline \
+  --init keyNet/pretrained_nets/keyNet.pt \
+  --device cuda:0
+
+# 5. Resume if necessary
+python train.py \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --out runs/baseline \
+  --resume runs/baseline/last.pt \
+  --epochs 60 \
+  --device cuda:0
+
+# 6. Evaluate the best checkpoint
+python evaluate.py \
+  --checkpoint runs/baseline/best.pt \
+  --data-dir data/normalized \
+  --mask-dir data/masks \
+  --manifest data/split.json \
+  --split test \
+  --out runs/test_baseline \
+  --device cuda:0
 ```
 
-Результаты: `metrics.json` и `keypoints.png`. Повторяемость — доля [0,1], где 0.9 означает 90%; порог в пикселях записан отдельно. Это проверка точек на синтетических парах отложенных изображений. Она не является оценкой распознавания личности.
+Before step 6, make sure the manifest check in `evaluate.py` is consistent with `data.py` and `train.py`.
 
-Для исследовательского вывода сравнивайте baseline/Hermite/маски при одинаковом manifest, предобучении, геометрии, количестве точек и нескольких seed. Даже хорошая синтетическая repeatability не гарантирует соответствий между реальными разными кадрами.
+---
 
-## Происхождение
+## Scientific context
 
-Проект основан на предоставленном пользователем PyTorch-коде KeyNet. Научный источник: [Key.Net, Barroso-Laguna et al., ICCV 2019](https://arxiv.org/abs/1904.00889). Файл pretrained-весов скопирован без изменения из приложения пользователя; его исходное происхождение и условия распространения следует сохранять при публикации.
+The architecture is based on Key.Net:
 
-В исходном ZIP отдельной лицензии не было. Эта поставка не присваивает стороннему коду новую лицензию. Для просмотра изменений архитектуры приложен `docs/architecture.diff`; это материал для ревью, а не самостоятельный установочный патч всего проекта.
+**Key.Net: Keypoint Detection by Handcrafted and Learned CNN Filters**  
+Barroso-Laguna et al., ICCV 2019.
+
+This repository should not be presented as an official implementation from the paper authors or as a ready-made benchmark for a particular iris dataset.
+
+When reporting experiments, document at least:
+
+- the source of the original architecture;
+- the source of pretrained weights;
+- the dataset and split;
+- augmentation parameters;
+- MSIP windows and weights;
+- the repeatability criterion;
+- the number of random seeds;
+- whether masks were used;
+- whether the Hermite variant was enabled.
